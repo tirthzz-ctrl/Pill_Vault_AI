@@ -1,0 +1,135 @@
+{
+  "profiles": {
+    "p1": {
+      "id": "p1",
+      "name": "John Doe",
+      "avatar": "JD",
+      "color": "indigo",
+      "created_at": "2026-07-30T18:47:27.452879"
+    },
+    "p2": {
+      "id": "p2",
+      "name": "Sarah Doe",
+      "avatar": "SD",
+      "color": "emerald",
+      "created_at": "2026-07-30T18:47:27.455188"
+    }
+  },
+  "active_profile": "p1",
+  "meds": {
+    "m1": {
+      "id": "m1",
+      "name": "Lisinopril",
+      "dosage_mg": "10",
+      "rx_number": "RX-88213",
+      "schedule": "1 tablet at 8:00 AM",
+      "doses_per_day": 1,
+      "qty_remaining": 5,
+      "initial_qty": 30,
+      "expiration_date": "2027-06-15",
+      "doctor_name": "Dr. Alvarez",
+      "interaction_group": "ace_inhibitor",
+      "refills_left": 2,
+      "pharmacy_name": "MedPlus Pharmacy",
+      "cost_estimate": 12.0,
+      "last_order_date": null,
+      "mandate_id": null,
+      "mandate_amount": null,
+      "profile_id": "p1"
+    },
+    "m2": {
+      "id": "m2",
+      "name": "Metformin",
+      "dosage_mg": "500",
+      "rx_number": "RX-77410",
+      "schedule": "1 tablet at 8:00 AM and 6:00 PM",
+      "doses_per_day": 2,
+      "qty_remaining": 42,
+      "initial_qty": 90,
+      "expiration_date": "2027-08-20",
+      "doctor_name": "Dr. Alvarez",
+      "interaction_group": "biguanide",
+      "refills_left": 1,
+      "pharmacy_name": "MedPlus Pharmacy",
+      "cost_estimate": 9.0,
+      "last_order_date": null,
+      "mandate_id": null,
+      "mandate_amount": null,
+      "profile_id": "p1"
+    },
+    "m3": {
+      "id": "m3",
+      "name": "Atorvastatin",
+      "dosage_mg": "20",
+      "rx_number": "RX-90055",
+      "schedule": "1 tablet at 9:00 PM",
+      "doses_per_day": 1,
+      "qty_remaining": 3,
+      "initial_qty": 30,
+      "expiration_date": "2026-12-01",
+      "doctor_name": "Dr. Chen",
+      "interaction_group": "statin",
+      "refills_left": 0,
+      "pharmacy_name": "Riverside Pharmacy",
+      "cost_estimate": 15.0,
+      "last_order_date": null,
+      "mandate_id": null,
+      "mandate_amount": null,
+      "profile_id": "p1"
+    },
+    "m4": {
+      "id": "m4",
+      "name": "Ibuprofen",
+      "dosage_mg": "200",
+      "rx_number": "RX-45123",
+      "schedule": "1 tablet as needed",
+      "doses_per_day": 1,
+      "qty_remaining": 60,
+      "initial_qty": 100,
+      "expiration_date": "2028-01-10",
+      "doctor_name": "Dr. Chen",
+      "interaction_group": "nsaid",
+      "refills_left": 3,
+      "pharmacy_name": "Riverside Pharmacy",
+      "cost_estimate": 8.0,
+      "last_order_date": null,
+      "mandate_id": null,
+      "mandate_amount": null,
+      "profile_id": "p2"
+    },
+    "m5": {
+      "id": "m5",
+      "name": "Vitamin D",
+      "dosage_mg": "1000",
+      "rx_number": "RX-67890",
+      "schedule": "1 capsule at 8:00 AM",
+      "doses_per_day": 1,
+      "qty_remaining": 90,
+      "initial_qty": 90,
+      "expiration_date": "2027-11-30",
+      "doctor_name": "Dr. Chen",
+      "interaction_group": "unclassified",
+      "refills_left": 5,
+      "pharmacy_name": "MedPlus Pharmacy",
+      "cost_estimate": 6.0,
+      "last_order_date": null,
+      "mandate_id": null,
+      "mandate_amount": null,
+      "profile_id": "p2"
+    }
+  },
+  "notifications": {},
+  "dose_history": [
+    {
+      "id": "d_1785417695_e2c1",
+      "med_id": "m1",
+      "timestamp": "2026-07-30T18:51:35.925212",
+      "quantity": 1
+    }
+  ],
+  "log": [
+    "[6:51 PM] -> PATIENT (CHECKIN): Have you taken your Lisinopril (10mg) yet?",
+    "[6:51 PM] -> PATIENT (SUMMARY): Updated Lisinopril details.",
+    "[6:51 PM] -> PATIENT (SUMMARY): Updated Lisinopril details."
+  ]
+}

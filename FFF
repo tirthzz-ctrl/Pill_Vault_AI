@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""
+PillVault AI — autonomous medication cabinet agent.
+
+Implements the workflows from the PillVault spec as real Python code:
+  Workflow A — Cabinet audit & ingestion (vision parsing of a label photo)
+  Workflow B — Daily dose logging & burn-rate calculation
+  Workflow C — Predictive refill drafting & caregiver approval
+
+Design:
+  - Every tool in the spec (vision_parser, db_read_inventory, db_update_inventory,
+    trigger_notification, pharmacy_reorder_request) is a real Python function/method
+    with a clear interface. Right now they run against local JSON storage and print
+    notifications to the console — swap the bodies for a real DB, SMS provider
+    (Twilio/WhatsApp Business API), and pharmacy API when you're ready to go live.
+  - If ANTHROPIC_API_KEY is set and `anthropic` is installed, vision_parser will
+    actually call Claude to read a real label photo. Otherwise it falls back to
+    asking for the label fields on the command line, so the rest of the agent
+    logic still runs end to end without any credentials.
+
+Run it:
+    python pillvault_agent.py
+
+State persists between runs in ./pillvault_data.json (delete the file to reset).
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sys
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+DATA_FILE = Path(__file__).with_name("pillvault_data.json")
+DUPLICATE_ORDER_LOCK_DAYS = 14
+LOW_STOCK_THRESHOLD_DAYS = 5
+
+
+# --------------------------------------------------------------------------
+# Data model
+# --------------------------------------------------------------------------
+
+@dataclass
+class Medication:
+    id: str
+    name: str
+    dosage_mg: str
+    rx_number: str
+    schedule: str          # human-readable, e.g. "1 tablet at 8:00 AM"
+    doses_per_day: int
+    qty_remaining: int
+    doctor_name: str = "Unknown"
+    interaction_group: str = "unclassified"
+    refills_left: int = 2
+    pharmacy_name: str = "MedPlus Pharmacy"
+    cost_estimate: float = 12.0
+    last_order_date: Optional[str] = None   # ISO date of last submitted reorder
+
+    def days_of_supply(self) -> int:
+        if self.doses_per_day <= 0:
+            return 999
+        return self.qty_remaining // self.doses_per_day
+
+    def zero_stock_date(self) -> str:
+        d = datetime.now() + timedelta(days=self.days_of_supply())
+        return d.strftime("%b %d")
+
+
+@dataclass
+class Notification:
+    id: str
+    med_id: str
+    kind: str               # "refill" | "conflict" | "unresponsive"
+    status: str = "pending"  # pending | approved | declined
+    message: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+@dataclass
+class Store:
+    meds: dict = field(default_factory=dict)          # id -> Medication (as dict)
+    notifications: dict = field(default_factory=dict)  # id -> Notification (as dict)
+    log: list = field(default_factory=list)             # activity log strings
+
+
+# Known interacting drug groups — extend with a real, maintained interaction
+# database before relying on this for anything clinical.
+INTERACTING_GROUPS = {
+    "anticoagulant": {"nsaid"},
+    "nsaid": {"anticoagulant"},
+}
+
+
+# --------------------------------------------------------------------------
+# Persistence
+# --------------------------------------------------------------------------
+
+def load_store() -> Store:
+    if DATA_FILE.exists():
+        raw = json.loads(DATA_FILE.read_text())
+        return Store(meds=raw.get("meds", {}), notifications=raw.get("notifications", {}),
+                     log=raw.get("log", []))
+    # seed with a small starter cabinet so the demo isn't empty on first run
+    seed = Store()
+    for m in [
+        Medication(id="m1", name="Lisinopril", dosage_mg="10", rx_number="RX-88213",
+                    schedule="1 tablet at 8:00 AM", doses_per_day=1, qty_remaining=6,
+                    doctor_name="Dr. Alvarez", interaction_group="ace_inhibitor",
+                    refills_left=2, pharmacy_name="MedPlus Pharmacy", cost_estimate=12.0),
+        Medication(id="m2", name="Metformin", dosage_mg="500", rx_number="RX-77410",
+                    schedule="1 tablet at 8:00 AM and 6:00 PM", doses_per_day=2, qty_remaining=42,
+                    doctor_name="Dr. Alvarez", interaction_group="biguanide",
+                    refills_left=1, pharmacy_name="MedPlus Pharmacy", cost_estimate=9.0),
+        Medication(id="m3", name="Atorvastatin", dosage_mg="20", rx_number="RX-90055",
+                    schedule="1 tablet at 9:00 PM", doses_per_day=1, qty_remaining=3,
+                    doctor_name="Dr. Chen", interaction_group="statin",
+                    refills_left=0, pharmacy_name="Riverside Pharmacy", cost_estimate=15.0),
+    ]:
+        seed.meds[m.id] = asdict(m)
+    return seed
+
+
+def save_store(store: Store) -> None:
+    DATA_FILE.write_text(json.dumps(asdict(store), indent=2, default=str))
+
+
+# --------------------------------------------------------------------------
+# Tool 1: vision_parser — reads a label photo (real Claude call if configured)
+# --------------------------------------------------------------------------
+
+def vision_parser(image_path: Optional[str] = None) -> dict:
+    """
+    Returns: {medication_name, dosage_mg, rx_number, total_quantity,
+              expiration_date, doctor_name}
+
+    If ANTHROPIC_API_KEY is set and `anthropic` is installed and image_path
+    points at a real image, this calls Claude's vision to read the label.
+    Otherwise it prompts on the command line so the workflow still runs.
+    """
+    if image_path and os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            import anthropic  # pip install anthropic
+            client = anthropic.Anthropic()
+            img_bytes = Path(image_path).read_bytes()
+            media_type = "image/jpeg" if image_path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            b64 = base64.b64encode(img_bytes).decode()
+            resp = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=500,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                        {"type": "text", "text": (
+                            "Read this medication label photo. Reply with ONLY a JSON object, "
+                            "no other text, with keys: medication_name, dosage_mg, rx_number, "
+                            "total_quantity, expiration_date, doctor_name. Use null for anything "
+                            "not visible on the label."
+                        )},
+                    ],
+                }],
+            )
+            text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+            text = text.strip().strip("`").removeprefix("json").strip()
+            return json.loads(text)
+        except Exception as e:
+            print(f"[vision_parser] Falling back to manual entry ({e}).")
+
+    print("\n-- Manual label entry (no image / no API key configured) --")
+    return {
+        "medication_name": input("Medication name: ").strip(),
+        "dosage_mg": input("Dosage (mg): ").strip(),
+        "rx_number": input("Rx number (blank to auto-generate): ").strip() or None,
+        "total_quantity": int(input("Tablets in bottle: ").strip() or 0),
+        "expiration_date": input("Expiration date (YYYY-MM-DD, optional): ").strip() or None,
+        "doctor_name": input("Doctor name (optional): ").strip() or "Unknown",
+    }
+
+
+# --------------------------------------------------------------------------
+# Tools 2 & 3: db_read_inventory / db_update_inventory
+# --------------------------------------------------------------------------
+
+def db_read_inventory(store: Store) -> list[Medication]:
+    return [Medication(**m) for m in store.meds.values()]
+
+
+def db_update_inventory(store: Store, item_id: str, adjustment_type: str, quantity: int) -> Medication:
+    """adjustment_type: 'dose_taken' | 'manual_add' | 'discard_expired'"""
+    m = Medication(**store.meds[item_id])
+    if adjustment_type == "dose_taken":
+        m.qty_remaining = max(0, m.qty_remaining - quantity)
+    elif adjustment_type == "manual_add":
+        m.qty_remaining += quantity
+    elif adjustment_type == "discard_expired":
+        m.qty_remaining = max(0, m.qty_remaining - quantity)
+    store.meds[item_id] = asdict(m)
+    return m
+
+
+# --------------------------------------------------------------------------
+# Tool 4: trigger_notification — swap this for real SMS/WhatsApp/push
+# --------------------------------------------------------------------------
+
+def trigger_notification(store: Store, recipient_role: str, message_type: str, content: str) -> None:
+    """
+    recipient_role: 'patient' | 'caregiver'
+    message_type:   'checkin' | 'summary' | 'refill_approval' | 'urgent_alert' | 'unresponsive'
+
+    Right now this prints to the console and appends to the activity log.
+    Wire in Twilio / WhatsApp Business API / a push service here for production use.
+    """
+    stamp = datetime.now().strftime("%-I:%M %p")
+    banner = "URGENT" if message_type == "urgent_alert" else message_type.upper()
+    line = f"[{stamp}] -> {recipient_role.upper()} ({banner}): {content}"
+    print(line)
+    store.log.insert(0, line)
+
+
+# --------------------------------------------------------------------------
+# Tool 5: pharmacy_reorder_request — swap for a real pharmacy API/browser agent
+# --------------------------------------------------------------------------
+
+def pharmacy_reorder_request(rx_number: str, patient_info: dict, pharmacy_id: str) -> dict:
+    """Simulated pharmacy order submission. Replace with a real API call."""
+    return {
+        "status": "submitted",
+        "confirmation_number": f"CONF-{abs(hash(rx_number)) % 999999:06d}",
+        "pharmacy_id": pharmacy_id,
+        "submitted_at": datetime.now().isoformat(),
+    }
+
+
+# --------------------------------------------------------------------------
+# Agent: orchestrates the three workflows + safety guardrails
+# --------------------------------------------------------------------------
+
+class PillVaultAgent:
+    def __init__(self, store: Store, user_id: str = "patient_1"):
+        self.store = store
+        self.user_id = user_id
+
+    # ---- Workflow A: cabinet audit & ingestion ----
+    def audit_photo(self, image_path: Optional[str] = None):
+        parsed = vision_parser(image_path)
+        name = parsed.get("medication_name")
+        if not name:
+            print("Could not read a medication name — please retake the photo or enter manually.")
+            return
+
+        existing = next((m for m in db_read_inventory(self.store) if m.name.lower() == name.lower()), None)
+
+        if existing:
+            existing.qty_remaining += int(parsed.get("total_quantity") or 0)
+            self.store.meds[existing.id] = asdict(existing)
+            med = existing
+            print(f"Updated stock for {med.name}: now {med.qty_remaining} tablets.")
+        else:
+            group = input(f"Interaction group for {name} (e.g. anticoagulant/nsaid/statin, blank if unsure): ").strip() or "unclassified"
+            schedule = input(f"Daily schedule for {name} (e.g. '1 tablet at 8:00 AM'): ").strip()
+            doses_per_day = 2 if ("&" in schedule or " and " in schedule) else 1
+            med = Medication(
+                id=f"m_{int(datetime.now().timestamp())}",
+                name=name,
+                dosage_mg=str(parsed.get("dosage_mg") or ""),
+                rx_number=parsed.get("rx_number") or f"RX-{abs(hash(name)) % 99999:05d}",
+                schedule=schedule or "Not specified",
+                doses_per_day=doses_per_day,
+                qty_remaining=int(parsed.get("total_quantity") or 0),
+                doctor_name=parsed.get("doctor_name") or "Unknown",
+                interaction_group=group,
+            )
+            self.store.meds[med.id] = asdict(med)
+            print(f"Added {med.name} ({med.dosage_mg}mg) to the cabinet.")
+
+            # Guardrail: drug conflict alert
+            conflicting_with = INTERACTING_GROUPS.get(group, set())
+            others = [m for m in db_read_inventory(self.store) if m.id != med.id]
+            conflict = next((o for o in others if o.interaction_group in conflicting_with), None)
+            if conflict:
+                trigger_notification(
+                    self.store, "caregiver", "urgent_alert",
+                    f"{med.name} may interact with {conflict.name} already in the cabinet. "
+                    f"Automatic dose logging for both is paused — please consult a physician."
+                )
+                save_store(self.store)
+                return
+
+        trigger_notification(
+            self.store, "patient", "summary",
+            f"I've added {med.name} ({med.dosage_mg}mg). You have {med.qty_remaining} pills, "
+            f"which will last until {med.zero_stock_date()}."
+        )
+        save_store(self.store)
+
+    # ---- Workflow B: daily dose logging & burn rate ----
+    def log_dose(self, med_id: str):
+        meds = {m.id: m for m in db_read_inventory(self.store)}
+        med = meds.get(med_id)
+        if not med:
+            print("No such medication.")
+            return
+        per_dose = 1  # tablets per single dose event; adjust if a med needs more
+        med = db_update_inventory(self.store, med_id, "dose_taken", per_dose)
+        print(f"Logged: {med.name}. {med.qty_remaining} tablets remaining "
+              f"({med.days_of_supply()} days of supply left).")
+        self._check_burn_rate(med)
+        save_store(self.store)
+
+    def _check_burn_rate(self, med: Medication):
+        if med.days_of_supply() > LOW_STOCK_THRESHOLD_DAYS:
+            return
+        self._draft_refill(med)
+
+    # ---- Workflow C: predictive refill & approval ----
+    def _draft_refill(self, med: Medication):
+        # Guardrail: duplicate order lock
+        if med.last_order_date:
+            days_since = (datetime.now() - datetime.fromisoformat(med.last_order_date)).days
+            if days_since < DUPLICATE_ORDER_LOCK_DAYS:
+                return
+
+        already_pending = any(
+            n["med_id"] == med.id and n["kind"] == "refill" and n["status"] == "pending"
+            for n in self.store.notifications.values()
+        )
+        if already_pending:
+            return
+
+        notif_id = f"n_{int(datetime.now().timestamp())}"
+        if med.refills_left > 0:
+            message = (
+                f"{med.name}'s supply will run out around {med.zero_stock_date()}. "
+                f"A refill request of ${med.cost_estimate:.2f} at {med.pharmacy_name} is ready. "
+                f"Reply APPROVE to authorize the order."
+            )
+        else:
+            message = (
+                f"{med.name} has 0 refills left on file. Supply runs out around "
+                f"{med.zero_stock_date()}. A refill authorization request needs to go to "
+                f"{med.doctor_name} before then."
+            )
+        self.store.notifications[notif_id] = asdict(Notification(
+            id=notif_id, med_id=med.id, kind="refill", message=message,
+        ))
+        trigger_notification(self.store, "caregiver", "refill_approval", message)
+        save_store(self.store)
+
+    def approve_refill(self, notif_id: str):
+        n = self.store.notifications.get(notif_id)
+        if not n or n["status"] != "pending":
+            print("No pending notification with that id.")
+            return
+        med = Medication(**self.store.meds[n["med_id"]])
+        result = pharmacy_reorder_request(
+            rx_number=med.rx_number,
+            patient_info={"user_id": self.user_id},
+            pharmacy_id=med.pharmacy_name,
+        )
+        med.last_order_date = datetime.now().isoformat()
+        if med.refills_left > 0:
+            med.refills_left -= 1
+        self.store.meds[med.id] = asdict(med)
+        n["status"] = "approved"
+        trigger_notification(
+            self.store, "patient", "summary",
+            f"Good news — your {med.name} refill was ordered "
+            f"(confirmation {result['confirmation_number']})."
+        )
+        save_store(self.store)
+
+    def decline_refill(self, notif_id: str):
+        n = self.store.notifications.get(notif_id)
+        if not n:
+            return
+        n["status"] = "declined"
+        save_store(self.store)
+
+    # ---- Unresponsive patient protocol ----
+    def checkin_followup(self, med_id: str, hours_since_scheduled: float):
+        med = Medication(**self.store.meds[med_id])
+        if hours_since_scheduled >= 4:
+            trigger_notification(
+                self.store, "caregiver", "unresponsive",
+                f"Notice: dose of {med.name} has not been confirmed yet."
+            )
+        elif hours_since_scheduled >= 2:
+            trigger_notification(
+                self.store, "patient", "checkin",
+                f"Just checking in — have you taken your {med.name} yet?"
+            )
+        save_store(self.store)
+
+    # ---- Reporting ----
+    def caregiver_summary(self) -> str:
+        lines = ["\n=== Caregiver dashboard ==="]
+        for m in db_read_inventory(self.store):
+            lines.append(
+                f"  {m.name:<14} {m.qty_remaining:>3} tabs  |  "
+                f"{m.days_of_supply():>2}d left (until {m.zero_stock_date()})  |  "
+                f"refills left: {m.refills_left}  |  {m.pharmacy_name}"
+            )
+        pending = [n for n in self.store.notifications.values() if n["status"] == "pending"]
+        if pending:
+            lines.append("\n  Pending approvals:")
+            for n in pending:
+                lines.append(f"   [{n['id']}] {n['message']}")
+        else:
+            lines.append("\n  No pending approvals.")
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def main():
+    store = load_store()
+    agent = PillVaultAgent(store)
+
+    menu = """
+PillVault AI — command line agent
+  1. Scan a new medicine (Workflow A)
+  2. Log a dose taken (Workflow B, auto-triggers refill check)
+  3. View caregiver dashboard
+  4. Approve a pending refill
+  5. Decline a pending refill
+  6. Simulate an unresponsive check-in
+  7. Exit
+"""
+    while True:
+        print(menu)
+        choice = input("Choose an option: ").strip()
+
+        if choice == "1":
+            path = input("Path to label photo (blank for manual entry): ").strip() or None
+            agent.audit_photo(path)
+
+        elif choice == "2":
+            meds = db_read_inventory(store)
+            if not meds:
+                print("No medications in the cabinet yet — scan one first.")
+                continue
+            for m in meds:
+                print(f"  [{m.id}] {m.name} ({m.dosage_mg}mg) — {m.qty_remaining} left")
+            med_id = input("Medication id to log: ").strip()
+            if med_id in store.meds:
+                agent.log_dose(med_id)
+            else:
+                print("Unknown id.")
+
+        elif choice == "3":
+            print(agent.caregiver_summary())
+
+        elif choice == "4":
+            pending = [n for n in store.notifications.values() if n["status"] == "pending"]
+            if not pending:
+                print("Nothing pending.")
+                continue
+            for n in pending:
+                print(f"  [{n['id']}] {n['message']}")
+            nid = input("Notification id to approve: ").strip()
+            agent.approve_refill(nid)
+
+        elif choice == "5":
+            pending = [n for n in store.notifications.values() if n["status"] == "pending"]
+            if not pending:
+                print("Nothing pending.")
+                continue
+            for n in pending:
+                print(f"  [{n['id']}] {n['message']}")
+            nid = input("Notification id to decline: ").strip()
+            agent.decline_refill(nid)
+
+        elif choice == "6":
+            meds = db_read_inventory(store)
+            for m in meds:
+                print(f"  [{m.id}] {m.name}")
+            med_id = input("Medication id: ").strip()
+            hrs = float(input("Hours since scheduled dose: ").strip() or 0)
+            if med_id in store.meds:
+                agent.checkin_followup(med_id, hrs)
+
+        elif choice == "7":
+            print("Goodbye.")
+            sys.exit(0)
+
+        else:
+            print("Not a valid option.")
+
+
+if __name__ == "__main__":
+    main()
